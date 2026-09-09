@@ -177,7 +177,11 @@ def test_stop_cannot_finish_between_acceptance_check_and_enqueue(monkeypatch):
     assert len(writes) == 1
 
 
-def test_pending_episode_wait_has_a_deadline(monkeypatch):
+def test_wait_confirms_episode_when_processed_never_flips(monkeypatch):
+    # Issue #795: graph.add() returning a UUID is the write confirmation.
+    # `processed` is an async extraction flag that may never flip, so a
+    # readable episode must confirm immediately instead of gating the
+    # terminal state for 600s.
     updater = _updater(
         monkeypatch,
         lambda **_kwargs: SimpleNamespace(uuid_="episode-1"),
@@ -186,13 +190,39 @@ def test_pending_episode_wait_has_a_deadline(monkeypatch):
     updater.client.graph.episode.get = lambda **_kwargs: SimpleNamespace(
         processed=False
     )
-    timestamps = iter([0.0, 2.0])
-    monkeypatch.setattr(updater_module, "ZEP_INGESTION_WAIT_TIMEOUT_SECONDS", 1)
-    monkeypatch.setattr(updater_module.time, "time", lambda: next(timestamps))
-    monkeypatch.setattr(updater_module.time, "sleep", lambda _seconds: None)
+    sleeps = []
+    monkeypatch.setattr(updater_module.time, "sleep", sleeps.append)
 
-    with pytest.raises(TimeoutError, match="pending"):
-        updater._wait_for_pending_episodes()
+    updater._wait_for_pending_episodes()
+
+    assert sleeps == []
+    assert updater.get_stats()["pending_episode_count"] == 0
+
+
+def test_wait_polls_until_a_written_episode_becomes_readable(monkeypatch):
+    # A get() returning None (not yet readable) must be polled until the
+    # episode confirms, still without requiring processed=True.
+    calls = []
+    results = iter([None, SimpleNamespace(processed=True)])
+
+    def get(**_kwargs):
+        calls.append(1)
+        return next(results)
+
+    updater = _updater(
+        monkeypatch,
+        lambda **_kwargs: SimpleNamespace(uuid_="episode-1"),
+    )
+    updater._pending_episode_uuids = ["episode-1"]
+    updater.client.graph.episode.get = get
+    sleeps = []
+    monkeypatch.setattr(updater_module.time, "sleep", sleeps.append)
+
+    updater._wait_for_pending_episodes()
+
+    assert len(calls) == 2
+    assert sleeps == [3]
+    assert updater.get_stats()["pending_episode_count"] == 0
 
 
 def test_explicit_graph_destruction_can_discard_a_stopped_failed_updater():
@@ -235,3 +265,70 @@ def test_flush_deadline_keeps_unattempted_platform_for_a_safe_retry(monkeypatch)
     updater._flush_remaining(deadline=1.0)
     assert updater._platform_buffers["reddit"] == []
     assert len(writes) == 2
+
+def test_wait_degrades_to_warning_when_reads_fail_past_soft_window(monkeypatch):
+    # A failed read of an already-confirmed write must not block the terminal
+    # state: after the soft window elapses, episodes that could not be
+    # read-confirmed are downgraded to a warning instead of raising
+    # TimeoutError.
+    warnings_logged = []
+    updater = _updater(
+        monkeypatch,
+        lambda **_kwargs: SimpleNamespace(uuid_="episode-1"),
+    )
+    updater._pending_episode_uuids = ["episode-1"]
+
+    def get(**_kwargs):
+        raise RuntimeError("read boom")
+
+    updater.client.graph.episode.get = get
+    monkeypatch.setattr(
+        updater_module.logger,
+        "warning",
+        lambda *args: warnings_logged.append(args),
+    )
+    timestamps = iter([0.0, 0.0, 0.0, 5.0])
+    monkeypatch.setattr(updater_module, "ZEP_INGESTION_WAIT_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(updater_module.time, "time", lambda: next(timestamps))
+    monkeypatch.setattr(updater_module.time, "sleep", lambda _seconds: None)
+
+    updater._wait_for_pending_episodes()
+
+    assert len(warnings_logged) == 1
+    assert updater.get_stats()["pending_episode_count"] == 0
+
+
+def test_wait_read_failure_on_one_episode_does_not_block_others(monkeypatch):
+    # The per-episode exception guard must skip only the failing episode;
+    # other already-written episodes in the same poll round still confirm.
+    warnings_logged = []
+    updater = _updater(
+        monkeypatch,
+        lambda **_kwargs: SimpleNamespace(uuid_="episode-1"),
+    )
+    updater._pending_episode_uuids = ["episode-bad", "episode-good"]
+    seen = []
+
+    def get(uuid_=None, **_kwargs):
+        seen.append(uuid_)
+        if uuid_ == "episode-bad":
+            raise RuntimeError("read boom")
+        return SimpleNamespace(processed=False)
+
+    updater.client.graph.episode.get = get
+    monkeypatch.setattr(
+        updater_module.logger,
+        "warning",
+        lambda *args: warnings_logged.append(args),
+    )
+    timestamps = iter([0.0, 0.0, 0.0, 5.0])
+    monkeypatch.setattr(updater_module, "ZEP_INGESTION_WAIT_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(updater_module.time, "time", lambda: next(timestamps))
+    monkeypatch.setattr(updater_module.time, "sleep", lambda _seconds: None)
+
+    updater._wait_for_pending_episodes()
+
+    assert "episode-good" in seen
+    assert "episode-bad" in seen
+    assert len(warnings_logged) == 1
+    assert updater.get_stats()["pending_episode_count"] == 0

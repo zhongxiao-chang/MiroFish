@@ -15,6 +15,7 @@ from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
 from ..utils.zep import (
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
+    ZEP_PROCESSED_SOFT_WINDOW_SECONDS,
     call_zep_read_with_retry,
     get_zep_client,
 )
@@ -597,27 +598,49 @@ class ZepGraphMemoryUpdater:
                     del self._platform_buffers[platform][:processed_count]
 
     def _wait_for_pending_episodes(self, *, deadline: float | None = None) -> None:
+        """Soft-confirm Zep ingestion without blocking terminal state forever.
+
+        graph.add() returning a UUID is the write-confirmation (issue #795:
+        data is already visible in Zep while the UI is stuck on "waiting for
+        graph write"). `processed` is an async extraction flag that may never
+        flip for a written episode, so it must not gate the terminal state.
+        Poll briefly for readability; episodes still unconfirmed after the
+        soft window are downgraded to a warning instead of raising TimeoutError.
+        """
         pending = set(self._pending_episode_uuids)
         if not pending:
             return
 
         if deadline is None:
             deadline = time.time() + ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
+        soft_deadline = min(
+            deadline,
+            time.time() + ZEP_PROCESSED_SOFT_WINDOW_SECONDS,
+        )
         while pending:
-            if time.time() >= deadline:
-                raise TimeoutError(
-                    f"Zep simulation ingestion timed out with {len(pending)} "
-                    "episode(s) pending"
-                )
+            if time.time() >= soft_deadline:
+                break
             for episode_uuid in list(pending):
-                episode = call_zep_read_with_retry(
-                    lambda: self.client.graph.episode.get(uuid_=episode_uuid),
-                    operation_name=f"poll simulation episode {episode_uuid}",
-                )
-                if getattr(episode, "processed", False):
+                try:
+                    episode = call_zep_read_with_retry(
+                        lambda: self.client.graph.episode.get(uuid_=episode_uuid),
+                        operation_name=f"poll simulation episode {episode_uuid}",
+                    )
+                except Exception:
+                    # Read-path failure must not block an already-confirmed write.
+                    continue
+                if episode is not None:
                     pending.remove(episode_uuid)
             if pending:
                 time.sleep(3)
+        if pending:
+            logger.warning(
+                "Zep ingestion soft-confirm window elapsed with %d episode(s) "
+                "written but not read-confirmed; not blocking terminal state "
+                "(simulation_id=%s)",
+                len(pending),
+                self.simulation_id,
+            )
         self._pending_episode_uuids = []
     
     def get_stats(self) -> Dict[str, Any]:

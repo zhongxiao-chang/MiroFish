@@ -26,6 +26,10 @@ ZEP_HTTP_REQUEST_TIMEOUT_SECONDS = 60.0
 # Zep ingestion is asynchronous and may take several minutes. Preserve the
 # original GraphBuilder deadline while keeping it separate from HTTP timeout.
 ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = 600
+# Soft window for confirming that a written episode is readable/processed.
+# graph.add() returning a UUID is the write-confirmation; `processed` is an
+# async extraction flag that must not block terminal simulation state forever.
+ZEP_PROCESSED_SOFT_WINDOW_SECONDS = 45.0
 MAX_ZEP_SEARCH_QUERY_CHARS = 400
 MAX_ZEP_SEARCH_RESULTS = 50
 

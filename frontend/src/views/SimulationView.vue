@@ -71,7 +71,7 @@ import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
 import { getProject, getGraphData } from '../api/graph'
-import { getSimulation, stopSimulation, getEnvStatus, closeSimulationEnv } from '../api/simulation'
+import { getSimulation, stopSimulation } from '../api/simulation'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 import { useI18n } from 'vue-i18n'
 

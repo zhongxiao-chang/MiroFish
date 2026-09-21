@@ -287,6 +287,10 @@ class ZepGraphMemoryUpdater:
         self._skipped_count = 0     # 被过滤跳过的活动数（DO_NOTHING）
         self._failed_batches: List[Dict[str, Any]] = []
         self._pending_episode_uuids: List[str] = []
+        # 降级停止的可观测状态：worker 未停时 tail 会被丢弃，调用方必须能从
+        # stats 里看到「带残留停止、丢了多少条」，不能默默当成功。
+        self._stop_degraded = False
+        self._dropped_tail_items = 0
         
         logger.info(f"ZepGraphMemoryUpdater 初始化完成: graph_id={graph_id}, batch_size={self.BATCH_SIZE}")
     
@@ -315,11 +319,20 @@ class ZepGraphMemoryUpdater:
     def stop(self):
         """Drain the worker, flush tail events, and soft-confirm Cloud ingestion.
 
-        Every wait in here is bounded by the soft window: a worker stuck in a
-        network retry, or a tail flush that would take minutes, must not hold
-        the simulation's terminal state behind the full hard timeout (#795
-        follow-up; the soft-confirm semantics of #798 apply to the drain too).
-        Degrading logs what was left behind instead of raising.
+        The join, the tail flush, and the confirm wait in
+        ``_wait_for_pending_episodes`` each use the soft window, so a worker
+        stuck in a network retry or a slow tail cannot hold the simulation's
+        terminal state behind the full hard timeout (#795 follow-up; the
+        soft-confirm semantics of #798 apply to the drain too). The bound is
+        checkpoint-style, not a wall-clock cap: the deadline is checked
+        between sends, so one in-flight ``graph.add`` (up to the HTTP timeout)
+        or one read-retry sequence can overshoot it, and stop() as a whole can
+        take up to roughly two soft windows.
+
+        Degrading stays observable instead of passing silently: a batch that
+        already failed always raises -- a known-incomplete graph write must
+        not be reported as success -- and a worker that cannot be stopped
+        records the dropped tail in ``get_stats()``.
         """
         deadline = time.time() + ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
         soft_deadline = min(
@@ -353,24 +366,34 @@ class ZepGraphMemoryUpdater:
                     self.simulation_id,
                     error,
                 )
-            if self._failed_batches:
-                raise RuntimeError(
-                    f"{len(self._failed_batches)} Zep activity batch(es) failed; "
-                    "simulation graph ingestion is incomplete"
-                )
         else:
-            # The worker is still alive and may be mid-send on the very buffers
-            # a flush would replay; graph.add() has no idempotency key, so the
-            # tail is deliberately left untouched and reported instead of
-            # risking duplicate extraction. Terminal state is not gated on it.
+            # Between its buffer snapshot and the matching delete, a live
+            # worker may already be sending the same activities a flush would
+            # replay; graph.add() has no idempotency key, so the tail is
+            # deliberately left untouched. The loss is recorded below instead
+            # of passing as a clean stop.
+            queued = self._activity_queue.qsize()
+            buffered = sum(len(items) for items in self._platform_buffers.values())
+            self._stop_degraded = True
+            self._dropped_tail_items += queued + buffered
             logger.warning(
                 "Zep updater worker did not stop within %.1fs; skipping the "
                 "tail flush so the terminal state is not blocked "
-                "(simulation_id=%s, queue=%d, buffered=%d)",
+                "(simulation_id=%s, dropped=%d, queue=%d, buffered=%d)",
                 join_timeout,
                 self.simulation_id,
-                self._activity_queue.qsize(),
-                sum(len(items) for items in self._platform_buffers.values()),
+                queued + buffered,
+                queued,
+                buffered,
+            )
+
+        # A batch that already failed leaves the graph known-incomplete; that
+        # must surface even when the drain above degraded, because callers
+        # (simulation_runner) gate the terminal status on this raise.
+        if self._failed_batches:
+            raise RuntimeError(
+                f"{len(self._failed_batches)} Zep activity batch(es) failed; "
+                "simulation graph ingestion is incomplete"
             )
 
         self._wait_for_pending_episodes(deadline=deadline)
@@ -694,6 +717,9 @@ class ZepGraphMemoryUpdater:
             "queue_size": self._activity_queue.qsize(),
             "buffer_sizes": buffer_sizes,                # 各平台缓冲区大小
             "running": self._running,
+            # 降级停止的可观测状态（worker 未停 = 带残留停止，不是干净收尾）
+            "stop_degraded": self._stop_degraded,
+            "dropped_tail_items": self._dropped_tail_items,
         }
 
 

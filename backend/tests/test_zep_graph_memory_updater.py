@@ -375,6 +375,43 @@ def test_stop_degrades_when_the_worker_does_not_stop_in_the_soft_window(monkeypa
     assert elapsed < 2.0, "stop() waited past the soft window"
     assert writes == [], "the tail was flushed while the worker could still send it"
     assert any("worker did not stop" in str(args[0]) for args in warnings_logged)
+    # The drop is observable, not silent: stats record the degraded stop and
+    # how many activities were left behind (P2 of the PTC review).
+    stats = updater.get_stats()
+    assert stats["stop_degraded"] is True
+    assert stats["dropped_tail_items"] == 1
+
+
+def test_stop_still_reports_failed_batches_when_the_worker_never_stops(monkeypatch):
+    # P1 of the PTC review: the degraded branch used to skip the failed-batch
+    # check, so a known-incomplete graph write returned as success and
+    # simulation_runner never flipped the simulation to FAILED. The check now
+    # runs after both branches; the base revision raised here too (via the
+    # hard-deadline TimeoutError).
+    def add(**_kwargs):
+        raise RuntimeError("write failed")
+
+    updater = _updater(monkeypatch, add)
+    updater._send_batch_activities([_activity(1)], "twitter")  # records a failed batch
+    monkeypatch.setattr(updater_module, "ZEP_STOP_DRAIN_SOFT_WINDOW_SECONDS", 0.2)
+    monkeypatch.setattr(updater_module.logger, "warning", lambda *args: None)
+
+    release = threading.Event()
+
+    def stuck_worker():
+        release.wait(timeout=5)  # never checks _running
+
+    worker = threading.Thread(target=stuck_worker, daemon=True)
+    worker.start()
+    updater._worker_thread = worker
+    updater._running = True
+
+    try:
+        with pytest.raises(RuntimeError, match="ingestion is incomplete"):
+            updater.stop()
+    finally:
+        release.set()
+        worker.join(timeout=1)
 
 
 def test_stop_degrades_to_a_warning_when_the_tail_flush_misses_its_window(monkeypatch):

@@ -30,6 +30,10 @@ ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = 600
 # graph.add() returning a UUID is the write-confirmation; `processed` is an
 # async extraction flag that must not block terminal simulation state forever.
 ZEP_PROCESSED_SOFT_WINDOW_SECONDS = 45.0
+# Soft window for draining the memory-updater worker in stop(). A worker stuck
+# in a network retry, or a tail flush that would take minutes, must not hold
+# the terminal simulation state behind the full hard timeout (#795 follow-up).
+ZEP_STOP_DRAIN_SOFT_WINDOW_SECONDS = 45.0
 MAX_ZEP_SEARCH_QUERY_CHARS = 400
 MAX_ZEP_SEARCH_RESULTS = 50
 

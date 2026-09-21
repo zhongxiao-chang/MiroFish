@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import threading
+import time
 from queue import Queue
 
 import pytest
@@ -332,3 +333,72 @@ def test_wait_read_failure_on_one_episode_does_not_block_others(monkeypatch):
     assert "episode-bad" in seen
     assert len(warnings_logged) == 1
     assert updater.get_stats()["pending_episode_count"] == 0
+
+
+def test_stop_degrades_when_the_worker_does_not_stop_in_the_soft_window(monkeypatch):
+    # #795 follow-up: the drain join used to be bounded only by the 600s hard
+    # deadline, so a worker stuck in a network retry held the simulation's
+    # terminal state long past the 45s soft window. The join is soft-bounded
+    # now and stop() reports the degrade instead of raising. The tail stays
+    # untouched: the live worker may be mid-send on exactly those activities,
+    # and graph.add() has no idempotency key to replay them safely.
+    writes = []
+    warnings_logged = []
+    updater = _updater(
+        monkeypatch,
+        lambda **kwargs: writes.append(kwargs) or SimpleNamespace(uuid_="episode-1"),
+    )
+    monkeypatch.setattr(updater_module, "ZEP_STOP_DRAIN_SOFT_WINDOW_SECONDS", 0.2)
+    monkeypatch.setattr(
+        updater_module.logger,
+        "warning",
+        lambda *args: warnings_logged.append(args),
+    )
+
+    release = threading.Event()
+
+    def stuck_worker():
+        release.wait(timeout=5)  # never checks _running: stuck in a network retry
+
+    worker = threading.Thread(target=stuck_worker, daemon=True)
+    worker.start()
+    updater._worker_thread = worker
+    updater._running = True
+    updater.add_activity(_activity())
+
+    started = time.monotonic()
+    updater.stop()
+    elapsed = time.monotonic() - started
+    release.set()
+    worker.join(timeout=1)
+
+    assert elapsed < 2.0, "stop() waited past the soft window"
+    assert writes == [], "the tail was flushed while the worker could still send it"
+    assert any("worker did not stop" in str(args[0]) for args in warnings_logged)
+
+
+def test_stop_degrades_to_a_warning_when_the_tail_flush_misses_its_window(monkeypatch):
+    # The flush is soft-bounded too: `_flush_remaining` keeps raising for
+    # direct callers (pinned above), but stop() is the caller that turns the
+    # drain timeout into a logged degrade, leaving the unattempted platform
+    # buffered for a safe retry instead of gating terminal state on it.
+    warnings_logged = []
+    updater = _updater(monkeypatch, lambda **_kwargs: SimpleNamespace(uuid_="episode-1"))
+    updater._platform_buffers["twitter"] = [_activity(1)]
+
+    def deadline_flush(*, deadline=None):
+        raise TimeoutError(
+            "Zep updater drain deadline elapsed before flushing all activities"
+        )
+
+    monkeypatch.setattr(updater, "_flush_remaining", deadline_flush)
+    monkeypatch.setattr(
+        updater_module.logger,
+        "warning",
+        lambda *args: warnings_logged.append(args),
+    )
+
+    updater.stop()
+
+    assert updater._platform_buffers["twitter"], "the buffered tail must survive for a retry"
+    assert any("tail flush did not finish" in str(args[0]) for args in warnings_logged)

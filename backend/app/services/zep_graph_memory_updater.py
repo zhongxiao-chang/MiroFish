@@ -16,6 +16,7 @@ from ..utils.locale import get_locale, set_locale
 from ..utils.zep import (
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
     ZEP_PROCESSED_SOFT_WINDOW_SECONDS,
+    ZEP_STOP_DRAIN_SOFT_WINDOW_SECONDS,
     call_zep_read_with_retry,
     get_zep_client,
 )
@@ -312,31 +313,64 @@ class ZepGraphMemoryUpdater:
         logger.info(f"ZepGraphMemoryUpdater 已启动: graph_id={self.graph_id}")
     
     def stop(self):
-        """Drain the worker, flush tail events, and wait for Cloud ingestion."""
+        """Drain the worker, flush tail events, and soft-confirm Cloud ingestion.
+
+        Every wait in here is bounded by the soft window: a worker stuck in a
+        network retry, or a tail flush that would take minutes, must not hold
+        the simulation's terminal state behind the full hard timeout (#795
+        follow-up; the soft-confirm semantics of #798 apply to the drain too).
+        Degrading logs what was left behind instead of raising.
+        """
         deadline = time.time() + ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
+        soft_deadline = min(
+            deadline,
+            time.time() + ZEP_STOP_DRAIN_SOFT_WINDOW_SECONDS,
+        )
         # Serialize the accepting->closed transition with add_activity's
         # check+enqueue operation. This closes the small race where a producer
         # could enqueue after both the worker and final flush had exited.
         with self._acceptance_lock:
             self._running = False
 
+        worker_stopped = True
+        join_timeout = 0.0
         if self._worker_thread and self._worker_thread.is_alive():
-            join_timeout = max(0.0, deadline - time.time())
+            join_timeout = max(0.0, soft_deadline - time.time())
             self._worker_thread.join(timeout=join_timeout)
-            if self._worker_thread.is_alive():
-                raise TimeoutError(
-                    f"Zep updater worker did not stop within {join_timeout:.0f}s"
+            worker_stopped = not self._worker_thread.is_alive()
+
+        if worker_stopped:
+            # The worker has drained the queue. Only now is it safe to flush
+            # buffers; doing this before join loses an item already dequeued by
+            # the worker but not yet buffered.
+            try:
+                self._flush_remaining(deadline=soft_deadline)
+            except TimeoutError as error:
+                logger.warning(
+                    "Zep updater tail flush did not finish within the soft "
+                    "window; the remaining activities stay buffered for a "
+                    "later retry (simulation_id=%s): %s",
+                    self.simulation_id,
+                    error,
                 )
-
-        # The worker has drained the queue. Only now is it safe to flush
-        # buffers; doing this before join loses an item already dequeued by the
-        # worker but not yet buffered.
-        self._flush_remaining(deadline=deadline)
-
-        if self._failed_batches:
-            raise RuntimeError(
-                f"{len(self._failed_batches)} Zep activity batch(es) failed; "
-                "simulation graph ingestion is incomplete"
+            if self._failed_batches:
+                raise RuntimeError(
+                    f"{len(self._failed_batches)} Zep activity batch(es) failed; "
+                    "simulation graph ingestion is incomplete"
+                )
+        else:
+            # The worker is still alive and may be mid-send on the very buffers
+            # a flush would replay; graph.add() has no idempotency key, so the
+            # tail is deliberately left untouched and reported instead of
+            # risking duplicate extraction. Terminal state is not gated on it.
+            logger.warning(
+                "Zep updater worker did not stop within %.1fs; skipping the "
+                "tail flush so the terminal state is not blocked "
+                "(simulation_id=%s, queue=%d, buffered=%d)",
+                join_timeout,
+                self.simulation_id,
+                self._activity_queue.qsize(),
+                sum(len(items) for items in self._platform_buffers.values()),
             )
 
         self._wait_for_pending_episodes(deadline=deadline)
